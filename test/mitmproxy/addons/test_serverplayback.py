@@ -1,3 +1,6 @@
+import itertools
+import time
+import tracemalloc
 import urllib
 
 import pytest
@@ -439,3 +442,223 @@ def test_server_playback_response_deleted():
         f1.response = f2.response = None
         assert not sp.next_flow(f1)
         assert not sp.flowmap
+
+
+# --- match-key construction regressions (uf-t283) --------------------------
+#
+# The match key must (a) keep the exact same equivalence relation as before
+# under every combination of the existing options, (b) stay unambiguous so
+# that adjacent requests which would collide under naive concatenation do not
+# match, and (c) not pay a large-body copy chain before hashing.
+
+
+_HASH_OPTION_GRID = {
+    "server_replay_ignore_content": [False, True],
+    "server_replay_ignore_host": [False, True],
+    "server_replay_ignore_port": [False, True],
+    "server_replay_ignore_params": [[], ["a"]],
+    "server_replay_ignore_payload_params": [[], ["param1"]],
+    "server_replay_use_headers": [[], ["foo"]],
+}
+
+
+def _reference_hash(flow, options):
+    """
+    The pre-existing match-key construction, kept verbatim as the semantic
+    oracle. Only the final serialization differs (that is the formula change
+    under test); the equivalence relation must be identical.
+    """
+    r = flow.request
+    _, _, path, _, query, _ = urllib.parse.urlparse(r.url)
+    queriesArray = urllib.parse.parse_qsl(query, keep_blank_values=True)
+
+    key = [str(r.scheme), str(r.method), str(path)]
+    if not options["server_replay_ignore_content"]:
+        if options["server_replay_ignore_payload_params"] and r.multipart_form:
+            key.extend(
+                (k, v)
+                for k, v in r.multipart_form.items(multi=True)
+                if k.decode(errors="replace")
+                not in options["server_replay_ignore_payload_params"]
+            )
+        elif options["server_replay_ignore_payload_params"] and r.urlencoded_form:
+            key.extend(
+                (k, v)
+                for k, v in r.urlencoded_form.items(multi=True)
+                if k not in options["server_replay_ignore_payload_params"]
+            )
+        else:
+            key.append(str(r.raw_content))
+
+    if not options["server_replay_ignore_host"]:
+        key.append(r.pretty_host)
+    if not options["server_replay_ignore_port"]:
+        key.append(r.port)
+
+    filtered = []
+    ignore_params = options["server_replay_ignore_params"] or []
+    for p in queriesArray:
+        if p[0] not in ignore_params:
+            filtered.append(p)
+    for p in filtered:
+        key.append(p[0])
+        key.append(p[1])
+
+    if options["server_replay_use_headers"]:
+        headers = []
+        for i in options["server_replay_use_headers"]:
+            v = r.headers.get(i)
+            headers.append((i, v))
+        key.append(headers)
+    return repr(key)
+
+
+def _semantic_flows():
+    """A flow zoo that exercises every branch of the key construction."""
+    flows = []
+    for _ in range(10):
+        flows.append(tflow.tflow(resp=True))
+
+    flows[1].request.content = b"foo\x00\xff\xfe binary"
+    flows[2].request.content = b""
+    flows[3].request.raw_content = None
+    flows[4].request.path = "/p?a=1&b=2&a=3"
+    flows[5].request.path = "/p?a=1&b=2&a=4"
+    flows[6].request.headers["foo"] = "bar"
+    flows[7].request.headers["foo"] = "baz"
+    flows[8].request.host = "other"
+    flows[9].request.port = 1234
+
+    # urlencoded payload, distinct ordering of the ignorable parameter
+    f = tflow.tflow(resp=True)
+    f.request.headers["Content-Type"] = "application/x-www-form-urlencoded"
+    f.request.content = b"a=1&param1=3&b=2"
+    flows.append(f)
+    f = tflow.tflow(resp=True)
+    f.request.headers["Content-Type"] = "application/x-www-form-urlencoded"
+    f.request.content = b"a=1&b=2&param1=4"
+    flows.append(f)
+
+    # multipart payloads differing only in the ignorable part
+    for value in (b"2", b"3"):
+        f = tflow.tflow(resp=True)
+        f.request.headers["content-type"] = "multipart/form-data; boundary=zz"
+        f.request.content = (
+            b'--zz\nContent-Disposition: form-data; name="a"\n\n1\n'
+            b'--zz\nContent-Disposition: form-data; name="param1"\n\n'
+            + value
+            + b"\n--zz--\r\n"
+        )
+        flows.append(f)
+
+    return flows
+
+
+def test_hash_semantics_match_reference():
+    """Option-combination match semantics are unchanged."""
+    flows = _semantic_flows()
+    names = list(_HASH_OPTION_GRID)
+    for combo in itertools.product(*_HASH_OPTION_GRID.values()):
+        options = dict(zip(names, combo))
+        s = serverplayback.ServerPlayback()
+        with taddons.context(s) as tctx:
+            tctx.configure(s, **options)
+            reference = [_reference_hash(f, options) for f in flows]
+            actual = [s._hash(f) for f in flows]
+        for i in range(len(flows)):
+            for j in range(i, len(flows)):
+                assert (reference[i] == reference[j]) == (
+                    actual[i] == actual[j]
+                ), f"option combination {options!r} diverges on flows {i} and {j}"
+
+
+def test_hash_rejects_ambiguous_concatenation():
+    """
+    Two requests whose fields run together under naive concatenation must
+    still hash differently. Replay traffic carries same and near-variant
+    requests back to back, so a boundary slip would make a variant match a
+    recorded flow it should miss.
+    """
+    s = serverplayback.ServerPlayback()
+    with taddons.context(s) as tctx:
+        tctx.configure(s)
+
+        # "GET" + "/ab" vs. a method that swallows the path prefix.
+        r1 = tflow.tflow(resp=True)
+        r1.request.method = "GET"
+        r1.request.path = "/ab"
+        r2 = tflow.tflow(resp=True)
+        r2.request.method = "GET/ab"
+        r2.request.path = ""
+        assert s._hash(r1) != s._hash(r2)
+
+        # body that ends where the next field begins: "a"+"bc" vs. "ab"+"c"
+        r3 = tflow.tflow(resp=True)
+        r3.request.content = b"a"
+        r3.request.host = "bc"
+        r4 = tflow.tflow(resp=True)
+        r4.request.content = b"ab"
+        r4.request.host = "c"
+        assert s._hash(r3) != s._hash(r4)
+
+        # same characters, different split between query name and value
+        r5 = tflow.tflow(resp=True)
+        r5.request.path = "/p?ab=c"
+        r6 = tflow.tflow(resp=True)
+        r6.request.path = "/p?a=bc"
+        assert s._hash(r5) != s._hash(r6)
+
+
+def _time_match(s, flow, rounds=5):
+    s._hash(flow)  # warm caches so we measure construction, not the first touch
+    start = time.perf_counter()
+    for _ in range(rounds):
+        s._hash(flow)
+    return (time.perf_counter() - start) / rounds
+
+
+def test_hash_large_body_cost_and_memory():
+    """
+    A single match on an 8MB binary body must stay at digest scale and must
+    not allocate a body-sized copy chain: <40ms per match and <2x body size
+    peak, as stated in the delivery notes.
+    """
+    body = bytes(8 * 1024 * 1024)
+    s = serverplayback.ServerPlayback()
+    with taddons.context(s) as tctx:
+        tctx.configure(s)
+        f = tflow.tflow(resp=True)
+        f.request.content = body
+
+        elapsed = _time_match(s, f)
+        assert elapsed < 0.040, f"8MB match took {elapsed * 1000:.2f}ms (>=40ms)"
+
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            s._hash(f)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 2 * len(body), (
+            f"8MB match peaked at {peak / 1e6:.2f}MB "
+            f"({peak / len(body):.2f}x body), expected <2x"
+        )
+
+
+def test_load_200_one_mb_sessions_speed():
+    """Batch-loading 200 x 1MB sessions must stay well under a few seconds."""
+    s = serverplayback.ServerPlayback()
+    with taddons.context(s) as tctx:
+        tctx.configure(s)
+        flows = []
+        for i in range(200):
+            f = tflow.tflow(resp=True)
+            f.request.content = bytes([i % 256]) * (1024 * 1024)
+            flows.append(f)
+
+        start = time.perf_counter()
+        s.load_flows(flows)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, f"loading 200 x 1MB took {elapsed:.2f}s (>=2s)"
+        assert s.count() == 200

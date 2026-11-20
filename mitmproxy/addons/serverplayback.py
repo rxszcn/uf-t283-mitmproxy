@@ -3,7 +3,6 @@ import logging
 import urllib
 from collections.abc import Hashable
 from collections.abc import Sequence
-from typing import Any
 
 import mitmproxy.types
 from mitmproxy import command
@@ -177,50 +176,104 @@ class ServerPlayback:
     def _hash(self, flow: http.HTTPFlow) -> Hashable:
         """
         Calculates a loose hash of the flow request.
+
+        The key is a self-delimiting stream of type-tagged, length-prefixed
+        components fed to SHA-256 incrementally. Each component carries a tag
+        (``s`` str, ``i`` int, ``b`` bytes, ``n`` None, ``H`` header list) and
+        its length, so distinct component sequences can never serialize to the
+        same byte stream - "adjacent" requests that would collide under naive
+        concatenation stay distinct. The request body is hashed straight from
+        ``raw_content`` rather than going through ``str()`` (which expands
+        non-printable binary data up to 4x) and another ``repr()`` copy. The
+        equivalence relation is unchanged: same requests match, different ones
+        don't.
         """
         r = flow.request
         _, _, path, _, query, _ = urllib.parse.urlparse(r.url)
         queriesArray = urllib.parse.parse_qsl(query, keep_blank_values=True)
 
-        key: list[Any] = [str(r.scheme), str(r.method), str(path)]
+        h = hashlib.sha256()
+        h.update(b"mitmproxy/serverplayback/v2\x00")
+
+        def feed(tag: bytes, payload: bytes) -> None:
+            h.update(tag)
+            h.update(len(payload).to_bytes(8, "big"))
+            h.update(payload)
+
+        def feed_item(tag: bytes, item) -> None:
+            if item is None:
+                h.update(b"n")
+                h.update((0).to_bytes(8, "big"))
+                return
+            if isinstance(item, str):
+                item = item.encode("utf8", "surrogateescape")
+            h.update(tag)
+            h.update(len(item).to_bytes(8, "big"))
+            h.update(item)
+
+        def feed_str(value: str) -> None:
+            feed_item(b"s", value)
+
+        def feed_pairs(tag: bytes, pairs, as_bytes: bool) -> None:
+            # Each element is individually tagged and length-prefixed, so the
+            # pair list is self-delimiting even when values are huge (e.g. a
+            # multipart file part); nothing large is copied in the process.
+            item_tag = b"b" if as_bytes else b"s"
+            h.update(tag)
+            h.update(len(pairs).to_bytes(8, "big"))
+            for k, v in pairs:
+                feed_item(item_tag, k)
+                feed_item(item_tag, v)
+
+        feed_str(str(r.scheme))
+        feed_str(str(r.method))
+        feed_str(str(path))
+
         if not ctx.options.server_replay_ignore_content:
-            if ctx.options.server_replay_ignore_payload_params and r.multipart_form:
-                key.extend(
-                    (k, v)
-                    for k, v in r.multipart_form.items(multi=True)
-                    if k.decode(errors="replace")
-                    not in ctx.options.server_replay_ignore_payload_params
+            ignore_payload_params = ctx.options.server_replay_ignore_payload_params
+            multipart = r.multipart_form.fields if ignore_payload_params else ()
+            urlencoded = r.urlencoded_form.fields if ignore_payload_params else ()
+            if multipart:
+                feed_pairs(
+                    b"M",
+                    [
+                        (k, v)
+                        for k, v in multipart
+                        if k.decode(errors="replace") not in ignore_payload_params
+                    ],
+                    as_bytes=True,
                 )
-            elif ctx.options.server_replay_ignore_payload_params and r.urlencoded_form:
-                key.extend(
-                    (k, v)
-                    for k, v in r.urlencoded_form.items(multi=True)
-                    if k not in ctx.options.server_replay_ignore_payload_params
+            elif urlencoded:
+                feed_pairs(
+                    b"U",
+                    [(k, v) for k, v in urlencoded if k not in ignore_payload_params],
+                    as_bytes=False,
                 )
+            elif r.raw_content is None:
+                feed(b"n", b"")
             else:
-                key.append(str(r.raw_content))
+                feed(b"b", r.raw_content)
 
         if not ctx.options.server_replay_ignore_host:
-            key.append(r.pretty_host)
+            feed_str(r.pretty_host)
         if not ctx.options.server_replay_ignore_port:
-            key.append(r.port)
+            feed(b"i", str(r.port).encode())
 
-        filtered = []
         ignore_params = ctx.options.server_replay_ignore_params or []
-        for p in queriesArray:
-            if p[0] not in ignore_params:
-                filtered.append(p)
-        for p in filtered:
-            key.append(p[0])
-            key.append(p[1])
+        for name, value in queriesArray:
+            if name not in ignore_params:
+                feed_str(name)
+                feed_str(value)
 
-        if ctx.options.server_replay_use_headers:
-            headers = []
-            for i in ctx.options.server_replay_use_headers:
-                v = r.headers.get(i)
-                headers.append((i, v))
-            key.append(headers)
-        return hashlib.sha256(repr(key).encode("utf8", "surrogateescape")).digest()
+        use_headers = ctx.options.server_replay_use_headers
+        if use_headers:
+            feed_pairs(
+                b"H",
+                [(i, r.headers.get(i)) for i in use_headers],
+                as_bytes=False,
+            )
+
+        return h.digest()
 
     def next_flow(self, flow: http.HTTPFlow) -> http.HTTPFlow | None:
         """
